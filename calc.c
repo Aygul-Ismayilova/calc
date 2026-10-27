@@ -1,7 +1,9 @@
 // Aygul Ismayilova 251ADB153
 // https://github.com/Aygul-Ismayilova/calc
 // Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
-
+// Resources used: C standard library documentation, 
+//  AI (Gemini) for algorithmic structure of recursive descent parser and memory buffer file reading.
+// link: https://share.gemini.google/15cVODMdsNsM
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,7 +16,7 @@
 #define LASTNAME   "ismayilova"
 #define STUDENT_ID "251ADB153"
 
-/* ---------- small helpers ---------- */
+/* small helpers  */
 
 static void *xmalloc(size_t n)
 {
@@ -56,7 +58,7 @@ static void buf_append(Buf *b, const char *s, size_t n)
     b->len += n;
 }
 
-/* ---------- tokenizer ---------- */
+/* tokenizer  */
 
 typedef enum {
     TOK_INT, TOK_FLOAT,
@@ -159,7 +161,7 @@ static void next_token(Parser *p)
     p->tok = t;
 }
 
-/* ---------- arithmetic ---------- */
+/*  arithmetic  */
 
 typedef struct {
     int is_float;
@@ -256,7 +258,7 @@ static int apply_pow(Parser *p, Value *base, Value e,
     return 1;
 }
 
-/* ---------- parser ----------
+/* parser 
  * Recursive descent, one function per precedence level:
  *   expr    := term  { ('+' | '-') term }
  *   term    := power { ('*' | '/') power }
@@ -415,7 +417,7 @@ static void eval_file(char *text, size_t len, Buf *out)
     }
 }
 
-/* ---------- files and folders ---------- */
+/*  files and folders  */
 
 /* Reads the whole file into memory with a single fread. Knowing the size
  * first means the data is read once and never copied again. One extra
@@ -608,7 +610,7 @@ static int process_dir(const char *dir, const char *outdir)
     return ok;
 }
 
-/* ---------- command line ---------- */
+/*  command line */
 
 static void usage(void)
 {
