@@ -59,8 +59,9 @@ static void buf_append(Buf *b, const char *s, size_t n)
 
 typedef enum {
     TOK_INT,
-    TOK_PLUS, TOK_MINUS,
-    TOK_END,     /* end of the line: its '\n', or the end of the file */
+    TOK_PLUS, TOK_MINUS, TOK_STAR, TOK_SLASH, TOK_POW,
+    TOK_LPAREN, TOK_RPAREN,
+    TOK_END,    /* end of the line: its '\n', or the end of the file */
     TOK_INVALID  /* a character that cannot start any token */
 } TokType;
 
@@ -72,8 +73,8 @@ typedef struct {
 
 /* The whole file is in one buffer and the tokenizer walks it with an index,
  * so a token's position is simply its index + 1. Nothing is counted
- * separately, so blank lines and every '\n' are included in the positions
- * automatically. */
+ * separately, so comment lines, blank lines and every '\n' are included in
+ * the positions automatically. */
 typedef struct {
     char *text;       /* whole file, text[len] == '\0' */
     size_t cur;       /* index of the first character not yet tokenized */
@@ -93,7 +94,7 @@ static void next_token(Parser *p)
     t.pos = i;
     /* When the line is used up, the END token sits on the '\n' itself (or
      * one past the last character if the file has no final '\n'). That is
-     * exactly where a missing operand must be reported. */
+     * exactly where "missing operand" and "missing )" must be reported. */
     if (i >= p->line_end) {
         p->cur = i;
         p->tok = t;
@@ -113,29 +114,32 @@ static void next_token(Parser *p)
 
     p->cur = i + 1;
     switch (s[i]) {
-    case '+': t.type = TOK_PLUS;  break;
-    case '-': t.type = TOK_MINUS; break;
+    case '+': t.type = TOK_PLUS;   break;
+    case '-': t.type = TOK_MINUS;  break;
+    case '/': t.type = TOK_SLASH;  break;
+    case '(': t.type = TOK_LPAREN; break;
+    case ')': t.type = TOK_RPAREN; break;
+    case '*':
+        /* "**" is read as one token, so "2 ** 3" is a power and "2 * * 3"
+         * is two operators in a row. */
+        if (i + 1 < p->line_end && s[i + 1] == '*') {
+            t.type = TOK_POW;
+            p->cur = i + 2;
+        } else {
+            t.type = TOK_STAR;
+        }
+        break;
     default:
-        /* '&', letters, ... The parser can never accept this token, so it
-         * stops here and the error position is this character. */
+        /* '#' outside a comment line, '&', letters, ... The parser can
+         * never accept this token, so it stops here and the error position
+         * is this character. */
         t.type = TOK_INVALID;
         break;
     }
     p->tok = t;
 }
 
-/* ---------- parser ----------
- * Recursive descent. For now there is only one precedence level:
- *   expr    := primary { ('+' | '-') primary }
- *   primary := NUMBER
- * + and - are left-associative because the loop in parse_expr combines the
- * result so far with the next operand, left to right: 10 - 3 - 2 is
- * (10 - 3) - 2 = 5.
- *
- * The parser evaluates as it goes. Every function returns 1 on success or
- * 0 after storing the error position. The rule "the error is at the token
- * the parser was looking at when it could not continue" is then simply
- * p->tok.pos at the moment we give up. */
+/* ---------- arithmetic ---------- */
 
 static int fail(Parser *p, size_t pos)
 {
@@ -143,29 +147,127 @@ static int fail(Parser *p, size_t pos)
     return 0;
 }
 
+/* Integer power by repeated squaring: O(log e) multiplications, so even
+ * 1 ** 1000000000000 is instant. The base is squared only while bits of the
+ * exponent remain, so no multiplication is done whose result is not needed
+ * (an unneeded last squaring could overflow even when the answer fits). */
+static long long int_pow(long long base, long long e)
+{
+    long long result = 1;
+    while (e > 0) {
+        if (e & 1)
+            result *= base;
+        e >>= 1;
+        if (e > 0)
+            base *= base;
+    }
+    return result;
+}
+
+/* ---------- parser ----------
+ * Recursive descent, one function per precedence level:
+ *   expr    := term  { ('+' | '-') term }
+ *   term    := power { ('*' | '/') power }
+ *   power   := primary [ '**' power ]
+ *   primary := NUMBER | '(' expr ')'
+ * Precedence comes from the call structure: expr can only combine whole
+ * terms, and a term is finished (all its * and / applied) before expr sees
+ * the next '+'. So in 3 + 2 * 5 the 2 * 5 is done first. In the same way
+ * a power is finished before term sees a '*'.
+ * + - * / are left-associative because their loops combine the result so
+ * far with the next operand, left to right: 10 - 3 - 2 is (10 - 3) - 2.
+ * ** is right-associative because power() calls itself for the exponent,
+ * so 2 ** 3 ** 2 is parsed as 2 ** (3 ** 2).
+ *
+ * The parser evaluates as it goes. Every function returns 1 on success or
+ * 0 after storing the error position. The rule "the error is at the token
+ * the parser was looking at when it could not continue" is then simply
+ * p->tok.pos at the moment we give up: a second operator, an invalid
+ * character, a ')' with no '(' or the END of the line. */
+
+static int parse_expr(Parser *p, long long *out);
+
 static int parse_primary(Parser *p, long long *out)
 {
-    if (p->tok.type == TOK_INT) {
-        *out = p->tok.ival;
+    Token t = p->tok;
+    switch (t.type) {
+    case TOK_INT:
+        *out = t.ival;
         next_token(p);
         return 1;
+    case TOK_LPAREN:
+        next_token(p);
+        if (!parse_expr(p, out))
+            return 0;
+        /* A missing ')' is noticed here, on whatever token came instead:
+         * usually END, so the error is at the end of the line. */
+        if (p->tok.type != TOK_RPAREN)
+            return fail(p, p->tok.pos);
+        next_token(p);
+        return 1;
+    default:
+        /* An operand was needed but this token cannot start one. This one
+         * place covers "two operators in a row" (we see the 2nd operator),
+         * "-5" (no unary minus), "()" (we see the ')'), invalid characters
+         * and a missing operand at the end of the line (we see END). */
+        return fail(p, t.pos);
     }
-    /* An operand was needed but this token cannot start one. This one
-     * place covers "two operators in a row" (we see the 2nd operator),
-     * "-5" (there is no unary minus), invalid characters, and a missing
-     * operand at the end of the line (we see END). */
-    return fail(p, p->tok.pos);
+}
+
+static int parse_power(Parser *p, long long *out)
+{
+    if (!parse_primary(p, out))
+        return 0;
+    if (p->tok.type != TOK_POW)
+        return 1;
+    next_token(p);
+    size_t exp_pos = p->tok.pos;  /* start of the whole exponent */
+    long long e;
+    if (!parse_power(p, &e))      /* recursion = right-associative */
+        return 0;
+    /* A negative exponent would give a fraction, which is not an integer.
+     * The exponent is the bad value, so the error goes to where it starts:
+     * for 2 ** (1 - 2) that is the '('. */
+    if (e < 0)
+        return fail(p, exp_pos);
+    *out = int_pow(*out, e);      /* x ** 0 is 1, also 0 ** 0 */
+    return 1;
+}
+
+static int parse_term(Parser *p, long long *out)
+{
+    if (!parse_power(p, out))
+        return 0;
+    while (p->tok.type == TOK_STAR || p->tok.type == TOK_SLASH) {
+        TokType op = p->tok.type;
+        next_token(p);
+        size_t right_pos = p->tok.pos;
+        long long r;
+        if (!parse_power(p, &r))
+            return 0;
+        if (op == TOK_STAR) {
+            *out *= r;
+        } else {
+            /* The right operand makes the division impossible, so the
+             * error goes to where that operand starts: in 8 / (4 - 2 * 2)
+             * it is the '(', not the 0 that comes out of it. */
+            if (r == 0)
+                return fail(p, right_pos);
+            *out /= r;  /* C division truncates toward zero, as required */
+        }
+    }
+    return 1;
 }
 
 static int parse_expr(Parser *p, long long *out)
 {
-    if (!parse_primary(p, out))
+    if (!parse_term(p, out))
         return 0;
     while (p->tok.type == TOK_PLUS || p->tok.type == TOK_MINUS) {
         TokType op = p->tok.type;
         next_token(p);
         long long r;
-        if (!parse_primary(p, &r))
+        if (!parse_term(p, &r))
             return 0;
         if (op == TOK_PLUS)
             *out += r;
@@ -185,8 +287,8 @@ static int eval_line(Parser *p, size_t start, size_t end, long long *out)
     if (!parse_expr(p, out))
         return 0;
     /* A complete expression must use up the whole line. Anything left over
-     * (a second number, an invalid character) is the token the parser
-     * could not continue with. */
+     * (an extra ')', a second number, an invalid character) is the token
+     * the parser could not continue with. */
     if (p->tok.type != TOK_END)
         return fail(p, p->tok.pos);
     return 1;
@@ -210,8 +312,10 @@ static void eval_file(char *text, size_t len, Buf *out)
         while (i < end && (text[i] == ' ' || text[i] == '\t'))
             i++;
 
-        /* Blank lines produce no output. */
-        if (i < end) {
+        /* Blank lines and comment lines produce no output. A comment line
+         * is skipped here, before the tokenizer sees it, so a '#' that
+         * reaches the tokenizer is always in the wrong place. */
+        if (i < end && text[i] != '#') {
             long long v;
             if (!eval_line(&p, start, end, &v)) {
                 out->len = 0;  /* drop results of earlier lines */
