@@ -2,11 +2,11 @@
 // https://github.com/Aygul-Ismayilova/calc
 // Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
 
-
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 #define NAME       "aygul"
@@ -362,19 +362,30 @@ static char *read_file(const char *path, size_t *len_out)
     return text;
 }
 
-/* Copies the file name out of a path ("labs/task1.txt" -> "task1") and
- * removes a final ".txt". */
-static char *base_name(const char *path)
+/* Copies the last part of a path ("labs/task1.txt" -> "task1.txt",
+ * "labs/" -> "labs") and, if strip_txt is set, removes a final ".txt". */
+static char *base_name(const char *path, int strip_txt)
 {
     size_t end = strlen(path);
+    while (end > 1 && path[end - 1] == '/')
+        end--;
     size_t start = end;
     while (start > 0 && path[start - 1] != '/')
         start--;
-    if (end - start > 4 && strncmp(path + end - 4, ".txt", 4) == 0)
+    if (strip_txt && end - start > 4 && strncmp(path + end - 4, ".txt", 4) == 0)
         end -= 4;
     char *s = xmalloc(end - start + 1);
     memcpy(s, path + start, end - start);
     s[end - start] = '\0';
+    return s;
+}
+
+/* Default output folder: <input_base>_<name>_<studentid> */
+static char *default_outdir(const char *base)
+{
+    size_t n = strlen(base) + sizeof("_" NAME "_" STUDENT_ID);
+    char *s = xmalloc(n);
+    snprintf(s, n, "%s_%s_%s", base, NAME, STUDENT_ID);
     return s;
 }
 
@@ -388,14 +399,19 @@ static char *output_path(const char *outdir, const char *base)
     return s;
 }
 
-/* An existing output folder is used as it is; a missing one is created. */
+/* Makes sure outdir is a folder we can write into: an existing folder is
+ * used as it is, a missing one is created. */
 static int ensure_dir(const char *outdir)
 {
     struct stat st;
-    if (stat(outdir, &st) == 0 && S_ISDIR(st.st_mode))
-        return 1;
+    if (stat(outdir, &st) == 0) {
+        if (S_ISDIR(st.st_mode))
+            return 1;
+        fprintf(stderr, "calc: '%s' exists and is not a folder\n", outdir);
+        return 0;
+    }
     if (mkdir(outdir, 0777) != 0) {
-        fprintf(stderr, "calc: cannot create folder '%s'\n", outdir);
+        fprintf(stderr, "calc: cannot create folder '%s': %s\n", outdir, strerror(errno));
         return 0;
     }
     return 1;
@@ -409,7 +425,7 @@ static int process_file(const char *in_path, const char *outdir)
     size_t len = 0;
     char *text = read_file(in_path, &len);
     if (!text) {
-        fprintf(stderr, "calc: cannot read '%s'\n", in_path);
+        fprintf(stderr, "calc: cannot read '%s': %s\n", in_path, strerror(errno));
         return 0;
     }
 
@@ -417,14 +433,14 @@ static int process_file(const char *in_path, const char *outdir)
     eval_file(text, len, &out);
     free(text);
 
-    char *base = base_name(in_path);
+    char *base = base_name(in_path, 1);
     char *path = output_path(outdir, base);
     free(base);
 
     int ok = 1;
     FILE *f = fopen(path, "w");
     if (!f) {
-        fprintf(stderr, "calc: cannot write '%s'\n", path);
+        fprintf(stderr, "calc: cannot write '%s': %s\n", path, strerror(errno));
         ok = 0;
     } else {
         if (out.len > 0 && fwrite(out.data, 1, out.len, f) != out.len)
@@ -439,31 +455,147 @@ static int process_file(const char *in_path, const char *outdir)
     return ok;
 }
 
-/* ---------- command line ----------
- * For now only "calc -o OUTDIR input.txt" (grade 4). The full command line
- * from section 4 (-d, default output folder) comes later. */
+static int is_regular_file(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static int ends_with_txt(const char *name)
+{
+    size_t n = strlen(name);
+    return n > 4 && strcmp(name + n - 4, ".txt") == 0;
+}
+
+static int cmp_names(const void *a, const void *b)
+{
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* Evaluates every *.txt file directly inside dir.
+ * The names are collected first and the folder is closed before any output
+ * is written, so output files created inside dir (calc -d x -o x) are never
+ * picked up as new inputs. Sorting only makes the order predictable. */
+static int process_dir(const char *dir, const char *outdir)
+{
+    DIR *d = opendir(dir);
+    if (!d) {
+        fprintf(stderr, "calc: cannot open folder '%s': %s\n", dir, strerror(errno));
+        return 0;
+    }
+    char **names = NULL;
+    size_t count = 0, cap = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (!ends_with_txt(e->d_name))
+            continue;
+        if (count == cap) {
+            cap = cap ? cap * 2 : 16;
+            char **grown = realloc(names, cap * sizeof *names);
+            if (!grown) {
+                fprintf(stderr, "calc: out of memory\n");
+                exit(2);
+            }
+            names = grown;
+        }
+        size_t n = strlen(e->d_name) + 1;
+        names[count] = xmalloc(n);
+        memcpy(names[count], e->d_name, n);
+        count++;
+    }
+    closedir(d);
+    if (count > 1)
+        qsort(names, count, sizeof *names, cmp_names);
+
+    int ok = 1;
+    for (size_t k = 0; k < count; k++) {
+        size_t n = strlen(dir) + strlen(names[k]) + 2;
+        char *path = xmalloc(n);
+        snprintf(path, n, "%s/%s", dir, names[k]);
+        /* Subfolders (even one called x.txt) and other non-regular files
+         * are skipped, as the task says. */
+        if (is_regular_file(path) && !process_file(path, outdir))
+            ok = 0;
+        free(path);
+        free(names[k]);
+    }
+    free(names);
+    return ok;
+}
+
+/* ---------- command line ---------- */
+
+static void usage(void)
+{
+    fprintf(stderr,
+            "usage: calc [-d DIR | --dir DIR] [-o OUTDIR | --output-dir OUTDIR] [input.txt]\n");
+}
 
 int main(int argc, char *argv[])
 {
-    const char *outdir = NULL, *input = NULL;
+    const char *dir = NULL, *outdir = NULL, *input = NULL;
 
     for (int k = 1; k < argc; k++) {
-        if (strcmp(argv[k], "-o") == 0 || strcmp(argv[k], "--output-dir") == 0) {
+        const char *a = argv[k];
+        int is_dir = strcmp(a, "-d") == 0 || strcmp(a, "--dir") == 0;
+        int is_out = strcmp(a, "-o") == 0 || strcmp(a, "--output-dir") == 0;
+        if (is_dir || is_out) {
             if (k + 1 >= argc) {
-                fprintf(stderr, "calc: option '%s' needs a value\n", argv[k]);
+                fprintf(stderr, "calc: option '%s' needs a value\n", a);
+                usage();
                 return 1;
             }
-            outdir = argv[++k];
+            k++;
+            if (is_dir)
+                dir = argv[k];
+            else
+                outdir = argv[k];
+        } else if (a[0] == '-') {
+            fprintf(stderr, "calc: unknown option '%s'\n", a);
+            usage();
+            return 1;
+        } else if (input) {
+            fprintf(stderr, "calc: only one input file is allowed\n");
+            usage();
+            return 1;
         } else {
-            input = argv[k];
+            input = a;
         }
     }
-    if (!outdir || !input) {
-        fprintf(stderr, "usage: calc -o OUTDIR input.txt\n");
+
+    if (!dir && !input) {
+        usage();
+        return 1;
+    }
+    if (dir && input) {
+        fprintf(stderr, "calc: give either -d DIR or an input file, not both\n");
+        usage();
         return 1;
     }
 
-    if (!ensure_dir(outdir) || !process_file(input, outdir))
+    /* Check the input before creating any output folder, so a typo in the
+     * input name does not leave an empty folder behind. */
+    struct stat st;
+    const char *in = dir ? dir : input;
+    if (stat(in, &st) != 0) {
+        fprintf(stderr, "calc: cannot open '%s': %s\n", in, strerror(errno));
         return 1;
-    return 0;
+    }
+    if (dir ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode)) {
+        fprintf(stderr, "calc: '%s' is not a %s\n", in, dir ? "folder" : "file");
+        return 1;
+    }
+
+    char *made_outdir = NULL;
+    if (!outdir) {
+        char *base = base_name(in, dir == NULL);  /* strip .txt only for a file */
+        made_outdir = default_outdir(base);
+        free(base);
+        outdir = made_outdir;
+    }
+
+    int ok = ensure_dir(outdir) &&
+             (dir ? process_dir(dir, outdir) : process_file(input, outdir));
+    free(made_outdir);
+    return ok ? 0 : 1;
 }
